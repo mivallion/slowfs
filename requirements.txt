@@ -1,2 +1,5 @@
 fusepy
 six
+fastapi
+pyyaml
+uvicorn

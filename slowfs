@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# Copyright (c) 2023, mivallion
 # Copyright (c) 2015, Nir Soffer
 # Copyright (c) 2013, Stavros Korokithakis
 # All rights reserved.
@@ -10,17 +11,23 @@ import atexit
 import collections
 import contextlib
 import errno
-import io
 import logging
 import os
 import socket
 import sys
 import threading
 import time
+from datetime import datetime
 
 import fuse
-import six
+import yaml
 
+def _construct_mapping(self, node, deep=False):
+    data = self.construct_mapping_org(node, deep)
+    return {str(key) : data[key] for key in data}
+
+yaml.SafeLoader.construct_mapping_org = yaml.SafeLoader.construct_mapping
+yaml.SafeLoader.construct_mapping = _construct_mapping
 
 def main(args):
     args = parse_args(args)
@@ -50,33 +57,89 @@ def parse_args(args):
     parser.add_argument('mountpoint', help='where to mount slowfs')
     return parser.parse_args(args)
 
-
 class Config(object):
-
     def __init__(self, path):
         self._path = path
         self.enabled = True
-        self._namespace = {}
         self.reload()
-
+        self.until_dict = dict()
+    
     def reload(self):
         if self._path is None:
-            self._namespace = {}
+            self._config = {}
         else:
-            self._namespace = self._load()
+            with open(self._path, 'r') as file:
+                self._config = yaml.safe_load(file)
+        if 'enabled' in self._config:
+            self.enabled = self._config['enabled']
 
-    def get(self, name, default=0):
-        return self._namespace.get(name, default)
+    def _get_default(self, name, default):
+        return self._config.get('ops', dict()).get(name, default)
 
-    def set(self, name, value):
-        self._namespace[name] = value
+    def get(self, name, path='', default=0):
+        current_config = self._config
+        
+        if path == '' or path == '/':
+            return self._get_default(name, default)
 
-    def _load(self):
-        d = {}
-        with io.open(self._path, "rb") as f:
-            six.exec_(f.read(), d)
-        return d
+        if path[0] == '/':
+            path = path[1:]
 
+        path_keys = path.split('/')
+        if len(path_keys) == 0:
+            return self._get_default(name, default)
+
+        key = path_keys[0]
+        if key not in current_config.get('files', dict()):
+            return self._get_default(name, default)
+        
+        seconds = self._get_default(name, default)
+        for key in path_keys:
+            files = current_config.get('files')
+            if key not in files:
+                return seconds
+            path_config = files.get(key)
+            path_ops = path_config.get('ops', dict())
+            if name in path_ops:
+                seconds = path_ops[name]
+            current_config = path_config
+        
+        return seconds
+    
+    def _set_op(self, ops, name, value):
+        ops[name] = value
+    
+    def set(self, name, value, path=''):
+        current_config = self._config
+
+        if path == '' or path == '/':
+            ops = current_config.get('ops', dict())
+            return self._set_op(ops, name, value)
+
+        if path[0] == '/':
+            path = path[1:]
+            
+        if path[0] == '/':
+            path = path[1:]
+        
+        path_keys = path.split('/')
+        if len(path_keys) == 0:
+            ops = current_config.get('ops', dict())
+            return self._set_op(ops, name, value)
+            
+        for key in path_keys:
+            if 'files' not in current_config:
+                current_config['files'] = dict()
+            files = current_config.get('files')
+            if key not in files:
+                files[key] = dict()
+            current_config = files.get(key)
+        
+        if 'ops' not in current_config:
+            current_config['ops'] = dict()
+        ops = current_config['ops']
+            
+        return self._set_op(ops, name, value)
 
 class ClientError(Exception):
     pass
@@ -173,12 +236,27 @@ class Controller(object):
         self.config.enabled = False
         return ""
 
+    def _get_set_response(self, name, path):
+        res = {
+            "op": name,
+            "delay": self.config.get(name, path),
+        }
+        if path in self.config.until_dict and name in self.config.until_dict[path]:
+            res['until'] = datetime.fromtimestamp(self.config.until_dict[path][name]).strftime("%Y-%m-%d %H:%M:%S")
+        
+        return res
+
     def do_get(self, *args):
         """ get config value """
         if not args:
             raise ClientError("NAME is required")
         name = args[0]
-        return "%s" % self.config.get(name)
+
+        path = ''
+        if len(args) > 1:
+            path = args[1]
+
+        return self._get_set_response(name, path)
 
     def do_set(self, *args):
         """ set config value """
@@ -189,8 +267,24 @@ class Controller(object):
             value = float(value)
         except ValueError as e:
             raise ClientError("Invalid config value: %s" % e)
-        self.config.set(name, value)
-        return ""
+
+        path = ''
+        if len(args) > 2:
+            path = args[2]
+
+        if len(args) > 3:
+            ttl = args[3]
+            try:
+                ttl = float(ttl)
+                self.config.set(name, value, path)
+                cur_ts = time.time()
+                if path not in self.config.until_dict:
+                    self.config.until_dict[path] = dict()
+                self.config.until_dict[path][name] = cur_ts + ttl
+            except ValueError as e:
+                raise ClientError("Invalid time value: %s" % e)
+
+        return self._get_set_response(name, path)
 
     def do_status(self, *args):
         """ show current status """
@@ -271,12 +365,12 @@ class SlowFS(fuse.Operations):
         self.root = os.path.realpath(root)
         self.config = config
         self.locked = LockManager()
-
+    
     def __call__(self, op, path, *args):
         if not hasattr(self, op):
             raise fuse.FuseOSError(errno.EFAULT)
         self.log.debug('-> %s %r %r', op, path, args)
-        self._delay(op)
+        self._delay(op, path)
         try:
             ret = getattr(self, op)(self.root + path, *args)
         except Exception as e:
@@ -285,9 +379,17 @@ class SlowFS(fuse.Operations):
         self.log.debug('<- %s %r', op, ret)
         return ret
 
-    def _delay(self, op):
-        if self.config.enabled:
-            seconds = self.config.get(op, 0)
+    def _delay(self, op, path):
+        if len(path) > 1 and path[0] == '/':
+            path = path[1:]
+
+        if path in self.config.until_dict and op in self.config.until_dict[path]:
+            if self.config.until_dict[path][op] < time.time():
+                self.config.set(op, 0, path)
+                del self.config.until_dict[path][op]
+
+        if self.config.enabled:     
+            seconds = self.config.get(op, path)
             if seconds:
                 time.sleep(seconds)
 

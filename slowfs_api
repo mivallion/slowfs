@@ -1,0 +1,91 @@
+from fastapi import FastAPI, Request
+import uvicorn
+import http.client
+import errno
+import os
+import signal
+import socket
+import sys
+import argparse
+
+
+app = FastAPI()
+
+def send_to_slowfs(command, op='', value='', path='', ttl=None):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    # Use an available address from the abstract namespace
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
+    sock.bind("")
+    msg = f'{command} {op} {value} {path}'
+    if ttl:
+        msg = f'{msg} {ttl}'
+    try:
+        sock.sendto(msg.encode("ascii"), "control")
+    except socket.error as e:
+        if e[0] != errno.ENOENT:
+            raise
+        print("No control socket - did you start slowfs in this directory?")
+        return -1, None
+    payload, addr = sock.recvfrom(4096)
+    payload = payload.decode("ascii")
+    code, response = payload.split(" ", 1)
+    code = int(code, 10)
+    return code, response
+
+@app.get("/ops/{path:path}")
+async def get_op(path: str, op: str):
+    code, response = send_to_slowfs("get", op, value='', path=path)
+    return {"code": code, "response": response}
+
+@app.put("/ops/{path:path}")
+async def put_op(path: str, op: str, value: float, ttl: float | None = None):
+    code, response = send_to_slowfs("set", op, value, path, ttl)
+    return {"code": code, "response": response}
+
+@app.get("/help")
+async def help(request: Request):
+    code, response = send_to_slowfs("help")
+    return {"code": code, "response": response}
+
+@app.get("/status")
+async def status(request: Request):
+    code, response = send_to_slowfs("status")
+    return {"code": code, "response": response}
+
+@app.get("/disable")
+async def disable(request: Request):
+    code, response = send_to_slowfs("disable")
+    return {"code": code, "response": response}
+
+@app.get("/enable")
+async def enable(request: Request):
+    code, response = send_to_slowfs("enable")
+    return {"code": code, "response": response}
+
+@app.get("/reload")
+async def reload(request: Request):
+    code, response = send_to_slowfs("reload")
+    return {"code": code, "response": response}
+
+@app.get("/log")
+async def log(level: str):
+    code, response = send_to_slowfs("log", level)
+    return {"code": code, "response": response}
+
+@app.post("/{path:path}")
+async def main(path: str):
+    return {"raw_url": str(request.url)}
+
+
+def parse_args(args):
+    parser = argparse.ArgumentParser(description='A slow filesystem API.')
+    parser.add_argument('--host', help='HTTP host', type=str, default='0.0.0.0')
+    parser.add_argument('-p', '--port', help='HTTP port', type=int, default=3000)
+    return parser.parse_args(args)
+
+def main(args):
+    args = parse_args(args)
+    uvicorn.run(app, host=args.host, port=args.port)
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
